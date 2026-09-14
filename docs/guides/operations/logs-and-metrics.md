@@ -18,9 +18,7 @@ Download reconstructed GPU metrics:
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 ```
 
-Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`. This requires a
-deployment that publishes GPU metric artifacts and may not yet be available in
-production.
+Metrics are written to `<output_dir>/<sub_job_id>/gpu.jsonl`.
 
 Tail a running job in the terminal:
 

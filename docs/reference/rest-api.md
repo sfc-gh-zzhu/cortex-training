@@ -1595,8 +1595,7 @@ to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and
 writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
 
 The reconstructed file contains the JSONL records emitted by the deployed
-training runtime. Metric artifact publication may not yet be available in
-production deployments.
+training runtime.
 
 ### 12.5 Zone scheduling events
 

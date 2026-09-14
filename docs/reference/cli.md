@@ -402,8 +402,7 @@ cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
 ```
 
 The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file. This feature depends on server-side metric
-artifacts and may not yet be available in production deployments.
+URIs for each reconstructed file.
 
 ### Log TUI
 
