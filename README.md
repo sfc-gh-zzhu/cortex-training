@@ -102,7 +102,7 @@ or `--host` / `--pat` / `--database`). Then:
 cortex-training download-metrics JOB_ID --output-dir ./metrics
 ```
 
-The command prints JSON. Each reconstructed file is listed under `metrics` as
+The command prints JSON. Each saved file is listed under `metrics` as
 `saved_path`. An empty `metrics` array means the job has no GPU samples yet —
 there will be nothing to plot.
 
@@ -113,11 +113,7 @@ do not difference consecutive rows). A JSON `null` means the value was not
 measured, which is distinct from `0.0`. A column may be present and still
 all-null.
 
-`record_version` `2` is current. Version `1` files also appear: they include
-`co_resident_job_count` and omit the four `sm_*` / `tensor_active_pct` /
-`dram_active_pct` fields.
-
-Example version `2` line:
+Example line:
 
 ```json
 {"record_version": 2, "sub_job_id": "JOB_ID:training:0", "sample_ts": "2026-09-16T00:00:00.000000000Z", "worker_num": 0, "local_gpu_index": 0, "global_gpu_index": 0, "gpu_uuid": "gpu-00000000-0000-0000-0000-000000000000", "gpu_util_pct": 87.5, "fb_used_bytes": 21474836480, "fb_free_bytes": 6442450944, "power_watts": 320.0, "gpu_temp_c": 62.0, "sm_active_pct": null, "sm_occupancy_pct": null, "tensor_active_pct": 40.0, "dram_active_pct": 30.0, "seq": 12, "seq_epoch": "00000000000000000000000000000000", "sample_interval_s": 5.0}
@@ -125,7 +121,7 @@ Example version `2` line:
 
 | Field | Meaning |
 |---|---|
-| `record_version` | JSONL schema version (`1` or `2`) |
+| `record_version` | JSONL schema version |
 | `sub_job_id` | Sub-job that produced the sample |
 | `sample_ts` | UTC scrape time (ISO-8601). Consecutive samples are `sample_interval_s` apart |
 | `worker_num` | GPU worker index in the sub-job, `0..n-1` |
@@ -136,11 +132,10 @@ Example version `2` line:
 | `fb_used_bytes` / `fb_free_bytes` | Frame-buffer used and free, bytes |
 | `power_watts` | Board power, watts |
 | `gpu_temp_c` | GPU temperature, Celsius |
-| `sm_active_pct` | SM active, percent (version `2` only; may be null) |
-| `sm_occupancy_pct` | SM occupancy, percent (version `2` only; may be null) |
-| `tensor_active_pct` | Tensor pipeline active, percent (version `2` only; may be null) |
-| `dram_active_pct` | DRAM active, percent (version `2` only; may be null) |
-| `co_resident_job_count` | Version `1` only |
+| `sm_active_pct` | SM active, percent (may be null) |
+| `sm_occupancy_pct` | SM occupancy, percent (may be null) |
+| `tensor_active_pct` | Tensor pipeline active, percent (may be null) |
+| `dram_active_pct` | DRAM active, percent (may be null) |
 | `seq` | Monotonic sample counter within `seq_epoch` |
 | `seq_epoch` | Opaque counter generation. `seq` restarts when this value changes |
 | `sample_interval_s` | Sampling period, seconds |
@@ -185,5 +180,4 @@ plt.tight_layout()
 plt.show()
 ```
 
-Swap `gpu_util_pct` for another non-null metric column. Version `1` files
-do not have the `sm_*` / `tensor_active_pct` / `dram_active_pct` columns.
+Swap `gpu_util_pct` for another non-null metric column.
