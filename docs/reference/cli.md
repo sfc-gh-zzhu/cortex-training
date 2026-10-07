@@ -3,6 +3,10 @@
 The `cortex-training` command and `cortex_training` Python package provide the
 supported command-line and SDK interfaces for Cortex Training.
 
+`ct` is installed as an alias for `cortex-training` and supports the same
+commands and flags. You can replace `cortex-training` with `ct` in any example
+below, such as `ct login config.json` or `ct --job JOB_ID step`.
+
 ## Installation
 
 Requires Python 3.10+. Installing the package gives you the `cortex-training`
@@ -32,18 +36,184 @@ cortex-training --help
 cortex-training tui --help
 ```
 
-## Cortex Training Jobs CLI
+## Jobs And Training Loops
+
+A job is a server-side lifecycle resource for remote model workers, not a
+training script. Its sub-jobs define the model, GPU requirements, and training
+or sampling configuration. Submitting a job starts those workers; once the
+job is running, you send batches, optimizer steps, or generation requests to
+its job ID.
+
+Jobs separate worker setup and GPU allocation from the code driving the
+experiment. You can reuse running workers across requests, inspect status and
+logs from another CLI process, and cancel the job to release capacity. A
+combined training and sampling job also lets an RL loop synchronize weights
+between its sub-jobs.
+
+The CLI and `CortexTrainingClient` operate on the same jobs; they are not
+alternative execution models. Use the CLI for setup, inspection, and individual
+operations. Use a Python loop or a [recipe](../../recipes/README.md) for dataset
+iteration, batching, rewards, evaluation, and repeated calls. The client loop
+creates a job or uses an existing job ID, submits operations, and polls their
+results. `submit --wait` waits for workers to be running; it does not upload or
+execute your Python loop.
+
+See [jobs and sub-jobs](../concepts/jobs-and-subjobs.md) and the
+[Python SDK reference](python-sdk.md#job-lifecycle) for details.
+
+## Quick Reference
+
+Global flags such as `--config`, `--job`, and `--compact` go **before** the
+subcommand. `login` also accepts its own `--config` after the subcommand.
+`--job-id` is an alias for `--job`:
+
+```bash
+cortex-training --config config.json list
+cortex-training --job JOB_ID step
+cortex-training checkpoints JOB_ID
+```
+
+The data-plane actions `fwd-bwd`, `step`, `load`, `generate`, and `weight-sync`
+require the global `--job JOB_ID` option. Their `--help` usage lines show its
+placement. Management commands such as `get` and `checkpoints` instead take a
+positional `JOB_ID` after the subcommand.
+
+### [Connection](#connection-config)
+
+```bash
+cortex-training --connection training list    # Use a Snowflake profile
+cortex-training list                          # Use the configured default profile
+cortex-training login config.json             # Remember config for future commands
+cortex-training login --config config.json    # Equivalent login syntax
+cortex-training --config config.json list     # Use config for one command
+```
+
+### [Submit Jobs](#submit-a-job)
+
+```bash
+cortex-training submit examples/api/training.json
+cortex-training submit examples/api/sampling.json
+cortex-training submit job.json --dry-run     # Validate without submitting
+cortex-training submit job.json --wait        # Wait until running, not finished
+cortex-training submit - < job.json           # Read JSON from stdin
+```
+
+### [Manage Jobs](#manage-existing-jobs)
+
+```bash
+cortex-training list
+cortex-training list --status running
+cortex-training get JOB_ID
+cortex-training wait JOB_ID                   # Wait until running, not finished
+cortex-training cancel JOB_ID
+cortex-training checkpoints JOB_ID
+cortex-training capacity                      # All supported GPU types
+cortex-training capacity --hardware B200
+```
+
+### [Training And Generation](#run-a-forward-backward-smoke-test)
+
+```bash
+cortex-training --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
+cortex-training --job JOB_ID step             # Default learning rate: 1e-4
+cortex-training --job JOB_ID step --lr 2e-5
+cortex-training --job JOB_ID generate examples/api/generate.json
+cortex-training --job JOB_ID weight-sync
+cortex-training --job JOB_ID weight-sync --weight-format lora
+```
+
+See also [generation payloads](#run-a-generate-smoke-test) and
+[weight-sync routing](#sync-training-weights).
+
+### [Load Checkpoints](#load-a-checkpoint-into-a-running-job)
+
+```bash
+cortex-training --job JOB_ID load CHECKPOINT_ID
+cortex-training --job JOB_ID load CHECKPOINT_ID --source-job-id SOURCE_JOB_ID
+cortex-training --job JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:training:0
+cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
+```
+
+### [Logs And Metrics](#log-tui)
+
+```bash
+cortex-training tui                          # Open job picker
+cortex-training tui JOB_ID                   # Open job logs
+cortex-training download-log JOB_ID --output-dir ./logs
+cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
+cortex-training download-metrics JOB_ID --output-dir ./metrics
+```
+
+See [execution logs](#download-execution-logs),
+[persisted stdout](#download-persisted-stdout), and [GPU metrics](#download-gpu-metrics)
+for download paths and output fields.
+
+### [Output And Help](#json-output-and-help)
+
+```bash
+cortex-training --compact list
+cortex-training get JOB_ID | jq '.sub_jobs'
+cortex-training --help
+cortex-training fwd-bwd --help
+```
+
+### Defaults And Waiting
+
+| Command | Default behavior | Alternative |
+|---------|------------------|-------------|
+| `submit` | Return after submission | `--wait` waits until running; `--dry-run` validates without submitting |
+| `wait JOB_ID` | Wait until running, not until training finishes | Use `get JOB_ID` to inspect current status |
+| `fwd-bwd`, `generate` | Poll the submitted request until completion | Set top-level `"poll": false` in the input JSON |
+| `step` | Poll until completion; learning rate `1e-4` | Set `--lr`; polling cannot be disabled |
+| `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
+| `capacity` | Query H200, B200, and B300 | Select one with `--hardware` |
+| `download-log`, `download-metrics` | Write under the current directory | Set `--output-dir` |
+
+## Detailed Reference
+
+- [Connection config](#connection-config), [login](#login), and [environment variables](#environment-variables)
+- [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), and [GPU capacity](#show-current-gpu-capacity)
+- [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
+- [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
+- [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
+- [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
+- [Log TUI](#log-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
 Training REST endpoint.
-The normal workflow is:
+The Snowflake-native workflow uses the same connection profiles as the Python
+Connector and Snowflake CLI:
 
-1. Create a connection config JSON.
-2. Run `cortex-training login --config config.json` once.
-3. Use `cortex-training list`, `submit`, `get`, `cancel`, `wait`, and
-   `capacity` without passing connection flags every time.
+```toml
+# ~/.snowflake/connections.toml
+[training]
+account = "ORG-ACCOUNT"
+host = "ACCOUNT.snowflakecomputing.com"
+user = "USER"
+authenticator = "programmatic_access_token"
+token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
+database = "CORTEX_TRAINING_DB"
+schema = "PUBLIC"
+```
 
-### Connection Config
+Protect files containing credentials, then select the named profile:
+
+```bash
+chmod 600 ~/.snowflake/connections.toml
+cortex-training --connection training list
+```
+
+`cortex-training list` with no connection arguments uses the
+Connector-configured default profile. Set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
+`default_connection_name = "training"` in Snowflake's `config.toml`, or name
+the connection `[default]`.
+
+Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
+a complete direct `--base-url` / `--host` + `--pat` connection, continues to
+win. This preserves existing scripts.
+
+### Legacy Connection Config
 
 For Snowflake PAT auth, use `host` for the account hostname. Do not use
 `base_url` for Snowflake PAT auth.
@@ -80,14 +250,20 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
-### Login
+### Legacy Login
 
 Login validates the config and stores only the config path, not the config
 contents:
 
 ```bash
+cortex-training login config.json
 cortex-training login --config config.json
 ```
+
+Provide exactly one config path, either positionally or with `--config` after
+`login`. Both forms validate and remember the same file. Login requires an
+explicit path even when a global `--config`, `CORTEX_TRAINING_CONFIG`, or a
+previous login is available.
 
 The login state is written to `~/.config/cortex-training/login.json` by default,
 or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.
@@ -106,33 +282,20 @@ export CORTEX_TRAINING_CONFIG=/path/to/config.json
 
 Explicit CLI flags override config values.
 
-### Commands
+### Manage Existing Jobs
 
 ```bash
 cortex-training list
 cortex-training list --status running
-cortex-training capacity
-cortex-training capacity --hardware B200
 cortex-training get JOB_ID
 cortex-training checkpoints JOB_ID
 cortex-training cancel JOB_ID
 cortex-training wait JOB_ID
-cortex-training --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
-cortex-training --job-id JOB_ID step --lr 1e-4
-cortex-training --job-id JOB_ID load CHECKPOINT_ID
-cortex-training --job-id JOB_ID generate examples/api/generate.json
-cortex-training --job-id JOB_ID weight-sync
-cortex-training download-log JOB_ID --output-dir /path/to/dir
-cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/dir
-cortex-training download-metrics JOB_ID --output-dir /path/to/dir
 ```
 
-Global flags must come before the subcommand:
-
-```bash
-cortex-training --compact list
-cortex-training --config config.json submit examples/api/training.json
-```
+`get` fetches current job details; `checkpoints` lists saved checkpoints.
+`wait` waits for the job to reach **running**, not for training to finish.
+See [Manage Jobs](../guides/operations/manage-jobs.md) for the operational workflow.
 
 ### Show Current GPU Capacity
 
@@ -148,6 +311,12 @@ The default command queries `H200`, `B200`, and `B300` independently and
 prints a `capacity_by_hardware` map. Each entry includes `has_reservation`,
 `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, and
 `available_gpus`.
+
+Each hardware lookup is attempted once with at most a 10-second connect timeout
+and a 30-second read timeout; a shorter SDK timeout still wins. A silent
+network, proxy, or service hop therefore fails instead of leaving the command
+blocked indefinitely. The three lookups run serially; use `--hardware` when
+only one type is needed.
 
 `--hardware` keeps the single-capacity response shape for one GPU type.
 
@@ -187,6 +356,12 @@ cortex-training submit job.json
 cortex-training submit job.json --wait
 cortex-training submit job.json --dry-run
 ```
+
+Without `--wait`, submission returns without waiting for the job to run.
+`--wait` waits until **running**, not until training finishes. `--dry-run`
+validates and prints the request body without sending it. A `log_probability`
+or `log_prob` sub-job is rejected before send, including on `--dry-run`, with
+`log_probability sub-jobs are not currently supported`.
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 
@@ -254,18 +429,7 @@ session's training sub-job. Sampling sub-jobs are not valid targets.
 
 #### Discovering Sub-Job IDs
 
-To find available training sub-jobs in a session:
-
-```python
-job = client.get_job(job_id)
-for sub_job in job["sub_jobs"]:
-    if sub_job["job_type"] == "training":
-        sub_job_id = sub_job["sub_job_id"]
-        n_gpus = sub_job["training_config"]["n_gpus"]
-        print(f"Training sub-job: {sub_job_id} (DP={n_gpus})")
-```
-
-Or via CLI:
+To find the training sub-job and its GPU count:
 
 ```bash
 cortex-training get JOB_ID | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
@@ -274,6 +438,8 @@ cortex-training get JOB_ID | jq '.sub_jobs[] | select(.job_type=="training") | {
 `get` takes the job id as a positional argument, so `--job-id` is not used here.
 The global `--job-id` option is only for the data-plane subcommands that have no
 positional job id (`fwd-bwd`, `step`, `load`, `generate`, `weight-sync`).
+For Python sub-job discovery, see the
+[runtime load API reference](rest-api.md#64-runtime-load---post-job_idload).
 
 #### When to Use load --target-sub-job-id
 
@@ -286,51 +452,29 @@ sampling sub-jobs and can be repeated — see
 
 #### DP Size Compatibility
 
-If loading a checkpoint into a sub-job with a **different DP size** (different
-`n_gpus`) than the checkpoint was saved from, the job **must** have been created
-with `load_optimizer_states=False`:
-
-```python
-training = SubJobConfig.training_job(
-    model_name="...",
-    n_gpus=16,  # Different from source checkpoint's DP size
-    load_optimizer_states=False,  # REQUIRED for DP size change
-    ...
-)
-```
-
-This setting is configured at **job creation time** and cannot be changed later.
-The optimizer states are DP-sharded and cannot be resized. If you forget this,
-the load will fail at runtime.
+When changing `n_gpus` from the checkpoint's source job, create the target
+training sub-job with `"load_optimizer_states": false` in its `training_config`.
+This cannot be changed at load time. See
+[DP size compatibility](rest-api.md#dp-size-compatibility) for the constraint.
 
 This is the runtime load path. Create-time resume still uses
-`source_checkpoint_info` in the submitted sub-job JSON.
+[`source_checkpoint_info`](rest-api.md#65-create-time-checkpoint-initialization)
+in the submitted sub-job JSON.
+
+`load` polls until the request completes by default. Pass `--no-poll` to return
+the request metadata without waiting for the result.
 
 ### Start Sampling From A Training Checkpoint
 
-Sampling requires a `weights-only` checkpoint. Save one from the training job,
-then create a standalone sampling job that references its public checkpoint and
-source job ids:
+Sampling requires a `weights-only` checkpoint and a new sampling job with
+`source_checkpoint_info` in its submitted JSON; `load` targets existing training
+jobs, not sampling jobs. Resumable checkpoints are not directly loadable by the
+sampling runtime.
 
-```python
-request_id = client.save(training_job_id, checkpoint_type="weights-only")
-checkpoint = client.poll_request(training_job_id, request_id)
-
-sampling = SubJobConfig.sampling_job(
-    model_name="Qwen/Qwen3-1.7B",
-    max_seq_len=2048,
-    n_gpus=1,
-    source_checkpoint_info={
-        "checkpoint_id": checkpoint["checkpoint_id"],
-        "source_job_id": training_job_id,
-    },
-)
-sampling_job_id = client.create_job(sub_jobs=[sampling])
-```
-
-The sampling job is independent: the source training job can be stopped after
-the checkpoint has been saved. Resumable DeepSpeed checkpoints contain
-optimizer state and are not directly loadable by the sampling runtime.
+See [Serve a Training Checkpoint](../guides/inference/serve-checkpoint.md)
+for the recipe workflow, or
+[Start sampling from saved weights](rest-api.md#134-start-sampling-from-saved-weights)
+for the Python save-and-create example.
 
 ### Run A Generate Smoke Test
 
@@ -343,9 +487,11 @@ cortex-training --job-id JOB_ID generate examples/api/generate.json
 
 The generate JSON contains `prompts`, optional `sampling_params`, and optional
 `routing_key` / `strict` fields. `sampling_params` may be one object applied to
-all prompts or a list of objects/nulls aligned with `prompts`. The CLI submits
-`generate` and polls the request by default. Set `"poll": false` to print only
-the submitted `request_id`.
+all prompts or a list of objects/nulls aligned with `prompts`. A flat list of
+integers such as `"prompts": [1, 2, 3]` is one pre-tokenized prompt, not three;
+use the nested form `[[1, 2], [3, 4]]` for a batch. The CLI submits `generate`
+and polls the request by default. Set `"poll": false` to print only the
+submitted `request_id`.
 
 ### Sync Training Weights
 
@@ -369,6 +515,10 @@ cortex-training --job-id JOB_ID weight-sync \
 
 If a backend needs a different operation routing hint, pass
 `--operation-sub-job-id` or `--operation-sub-job-type`.
+
+Use `--weight-format lora` for adapter-only sync; `vllm` and `hf` are also
+accepted formats. Pass `--no-poll` to return the request metadata without waiting
+for synchronization to complete.
 
 ### Download Execution Logs
 
@@ -413,11 +563,9 @@ URIs for each reconstructed file.
 
 ### Log TUI
 
-`cortex-training tui` is a read-only terminal UI for tailing a running job's logs
-live. It reuses the same connection handling as `cortex-training` — login state,
-`--config` /
-`CORTEX_TRAINING_CONFIG`, the `CORTEX_TRAINING_*` / `SNOWFLAKE_*` env vars, or explicit
-flags. So once you've run `cortex-training login` you can just launch it:
+`cortex-training tui` is a read-only terminal UI for tailing a running job's
+logs live. It uses the same connection handling and fallback order as the CLI,
+including named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens a job picker
@@ -427,6 +575,7 @@ cortex-training tui JOB_ID          # opens that job's logs directly
 Without login state, pass connection details the same way as the CLI:
 
 ```bash
+cortex-training tui JOB_ID --connection training
 cortex-training tui JOB_ID --config config.json
 cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
   --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
@@ -476,11 +625,31 @@ In the job picker, `/` filters by id/status/type and `r` refreshes. The
 `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
 
+### JSON Output And Help
+
+Commands other than the TUI write JSON to stdout, pretty-printed by default.
+Use the global `--compact` flag for compact JSON, or pipe output to `jq`:
+
+```bash
+cortex-training --compact list
+cortex-training get JOB_ID | jq '.sub_jobs'
+```
+
+Use `cortex-training --help` to list commands and global flags, or
+`cortex-training COMMAND --help` for command-specific arguments. Job-scoped
+data-plane help includes the required global option:
+
+```text
+usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
+```
+
 ### Environment Variables
 
 Connection values can also come from:
 
 ```bash
+CORTEX_TRAINING_CONNECTION
+SNOWFLAKE_DEFAULT_CONNECTION_NAME
 CORTEX_TRAINING_CONFIG
 CORTEX_TRAINING_BASE_URL
 CORTEX_TRAINING_HOST
@@ -495,15 +664,33 @@ CORTEX_TRAINING_ENDPOINT
 ```
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
-PAT-authenticated clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
+Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 (truthy) also emits successful outcomes for essential operations; failures
 are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
+
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
+as JSON lists inside the request frame instead of as tensors. The request body
+stays a DSSST1 frame either way.
 
 ### Troubleshooting
 
 If you see `provide --base-url for local/mock use, or both --host and --pat`,
 the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
 `CORTEX_TRAINING_PAT`.
+
+If no legacy config or complete direct connection is present, the CLI falls
+back to the Snowflake Connector's configured default. If your profile is not
+named `default`, pass `--connection NAME` or set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+
+If Snowflake rejects your PAT, the CLI keeps the original error and adds next
+steps: `394400 (08001) ... Programmatic access token is invalid` from a
+connection profile, or a `401` on a request that sent the PAT directly
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
+user with no network policy; see
+[Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
+A `401` on a connection-profile request gets no hint, because the PAT was
+already accepted at login.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a

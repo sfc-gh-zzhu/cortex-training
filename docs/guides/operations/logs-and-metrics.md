@@ -116,7 +116,7 @@ Recipe-level metrics are also written under each recipe's `log_path`.
 
 ## Client operation metrics
 
-PAT-authenticated Python clients also emit best-effort client-side operation
+Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods are
 emitted automatically; successful outcomes require
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1`. See

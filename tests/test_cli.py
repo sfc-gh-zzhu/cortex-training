@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -364,6 +365,89 @@ def test_submit_dry_run_rejects_two_training_sub_jobs(tmp_path):
 
     assert rc == 1
     assert "at most one training sub-job is supported per job" in stderr.getvalue()
+
+
+# Spellings a caller could plausibly put in job JSON for the unsupported
+# log-probability type.
+LOG_PROBABILITY_JOB_TYPES = [
+    "log_probability",
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
+
+
+def _write_log_probability_job(tmp_path, job_type):
+    path = tmp_path / "log-probability.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {
+                        "job_type": "sampling",
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                    {
+                        "job_type": job_type,
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+def test_submit_dry_run_rejects_log_probability_sub_jobs(tmp_path, job_type):
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, job_type)
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+
+
+def test_submit_rejects_log_probability_sub_jobs(tmp_path):
+    instances = []
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, "log_probability")
+
+    rc = cli.main(
+        _base_args() + ["submit", str(path)],
+        client_factory=_factory(instances),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+    assert instances[0].submitted_body is None
+
+
+# The CLI duplicates these so `submit --dry-run` never imports the client; keep
+# the two copies from drifting apart.
+def test_cli_log_probability_rejection_matches_client():
+    from cortex_training import client
+
+    assert (
+        cli._LOG_PROBABILITY_JOB_TYPE_ALIASES
+        == client._LOG_PROBABILITY_JOB_TYPE_ALIASES
+    )
+    assert (
+        cli._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+        == client._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+    )
 
 
 def test_list_prints_jobs_with_status_filter():
@@ -932,6 +1016,58 @@ def test_generate_can_skip_poll(tmp_path):
     }
 
 
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
+
+
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():
     instances = []
     stdout = io.StringIO()
@@ -1316,7 +1452,8 @@ def test_invalid_config_value_type_returns_error(tmp_path):
     assert "config base_url must be a string" in stderr.getvalue()
 
 
-def test_login_persists_config_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_flags", [[], ["--config"]])
+def test_login_persists_config_path(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(
         tmp_path,
@@ -1325,7 +1462,7 @@ def test_login_persists_config_path(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stdout = io.StringIO()
 
-    rc = cli.main(["login", "--config", str(config)], stdout=stdout)
+    rc = cli.main(["login"] + config_flags + [str(config)], stdout=stdout)
 
     assert rc == 0
     saved = json.loads(login_state.read_text(encoding="utf-8"))
@@ -1407,14 +1544,217 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     assert rc == 0
 
 
-def test_login_rejects_invalid_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_flags", [[], ["--config"]])
+def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
     login_state = tmp_path / "login.json"
     config = _write_config(tmp_path, {"typo": "value"})
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stderr = io.StringIO()
 
-    rc = cli.main(["login", "--config", str(config)], stderr=stderr)
+    rc = cli.main(["login"] + config_flags + [str(config)], stderr=stderr)
 
     assert rc == 1
     assert not login_state.exists()
     assert "unknown config key" in stderr.getvalue()
+
+
+def test_no_legacy_config_falls_back_to_default_snowflake_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+    assert seen["database"] is None
+    assert seen["schema"] is None
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("SNOWFLAKE_HOST", "leftover.example"),
+        ("SNOWFLAKE_PAT", "leftover-pat"),
+    ],
+)
+def test_incomplete_direct_environment_falls_back_to_default_profile(
+    tmp_path, monkeypatch, environment_name, environment_value
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(environment_name, environment_value)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+
+
+def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "list"],
+        client_factory=make_client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] == "training-profile"
+
+
+def test_existing_legacy_config_wins_over_profile_fallback(tmp_path, monkeypatch):
+    config = _write_config(
+        tmp_path,
+        {"base_url": "http://legacy.local", "database": "LEGACY_DB"},
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is False
+    assert seen["base_url"] == "http://legacy.local"
+
+
+def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text(
+        json.dumps({"config_path": str(tmp_path / "removed-config.json")}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+
+
+def test_named_connection_conflicts_with_direct_flags():
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "--host", "x.test", "list"],
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--connection cannot be combined" in stderr.getvalue()
+
+
+def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
+    )
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    client_cls = MagicMock()
+    connected = object()
+    client_cls.from_connection_name.return_value = connected
+
+    assert cli.build_client(args, client_cls) is connected
+    client_cls.from_connection_name.assert_called_once_with(
+        connection_name="training-profile",
+        database=None,
+        schema=None,
+        endpoint="cortex-training",
+        poll_interval=0.5,
+        poll_timeout=1800.0,
+        verify_ssl=True,
+    )
+
+
+def _http_error(status_code: int, headers: dict[str, str] | None = None):
+    import requests
+
+    request = requests.Request(
+        "GET", "https://account.snowflakecomputing.com/api", headers=headers or {}
+    ).prepare()
+    response = requests.Response()
+    response.status_code = status_code
+    response.request = request
+    response._content = b'{"code": "390100", "message": "rejected"}'
+    return requests.HTTPError(f"{status_code} Client Error", response=response)
+
+
+_PAT_HEADERS = {
+    "Authorization": "Bearer REDACTED",
+    "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+}
+
+
+def test_format_error_explains_rejected_pat_on_401() -> None:
+    message = cli._format_error(_http_error(401, _PAT_HEADERS))
+
+    assert message.startswith("401 Client Error")
+    assert "Snowflake rejected your credentials (HTTP 401)." in message
+    assert "Your user has no network policy." in message
+    assert "authentication.md#network-policy-requirement" in message
+
+
+def test_format_error_skips_pat_hint_for_session_token_401() -> None:
+    message = cli._format_error(
+        _http_error(401, {"Authorization": 'Snowflake Token="REDACTED"'})
+    )
+
+    assert "401 Client Error" in message
+    assert "network policy" not in message
+
+
+def test_format_error_leaves_other_http_errors_unchanged() -> None:
+    message = cli._format_error(_http_error(409, _PAT_HEADERS))
+
+    assert "409 Client Error" in message
+    assert "network policy" not in message

@@ -32,6 +32,7 @@ import base64
 import gzip
 import importlib
 import json
+import logging
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -42,6 +43,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 # Import the module directly so we don't pull src/cortex_training/__init__.py
 # (which imports torch via wire.py).
@@ -64,6 +66,17 @@ InferenceConfig = nc.InferenceConfig
 SubJobConfig = nc.SubJobConfig
 CortexTrainingClient = nc.CortexTrainingClient
 Hardware = nc.Hardware
+
+# Spellings a caller could plausibly pass for the unsupported log-probability
+# type: the enum, loose casing, the fully-qualified enum name, the short alias,
+# and surrounding whitespace.
+LOG_PROBABILITY_JOB_TYPES = [
+    JobType.LOG_PROBABILITY,
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
 
 
 def _wire_load(data: bytes):
@@ -139,65 +152,50 @@ class TestTrainingConfig:
         _ok_training().validate()
 
     def test_validate_rejects_zero_max_seq_len(self):
-        tc = _ok_training()
-        tc.max_seq_len = 0
-        with pytest.raises(ValueError, match="max_seq_len"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=0, train_batch_size=1, n_gpus=2)
 
     def test_validate_rejects_zero_train_batch_size(self):
-        tc = _ok_training()
-        tc.train_batch_size = 0
-        with pytest.raises(ValueError, match="train_batch_size"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=0, n_gpus=2)
 
     def test_validate_rejects_empty_optimizer(self):
-        tc = _ok_training()
-        tc.optimizer = {}
-        with pytest.raises(ValueError, match="optimizer"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="optimizer"):
+            TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
 
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fp32_lm_head": True,
-            "fused_lm_head_token_chunk_size": 8192,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-                "fused_lm_head_token_chunk_size": 8192,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fp32_lm_head=True, fused_lm_head_token_chunk_size=8192,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True, "fused_lm_head_token_chunk_size": 8192},
+        )
 
     def test_validate_nested_primerl_overrides_top_level_fused_ce(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": "liger",
-            "fp32_lm_head": True,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fused_cross_entropy="liger", fp32_lm_head=True,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True},
+        )
 
     def test_validate_rejects_default_fused_ce_with_chunked_lm_head(self):
-        tc = _ok_training()
-        tc.extra = {"fused_lm_head_token_chunk_size": 8192}
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_lm_head_token_chunk_size=8192,
+            )
 
     def test_validate_rejects_nested_primerl_fused_ce_with_fp32_lm_head(self):
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_cross_entropy=False,
+                prime_rl={"fused_cross_entropy": "liger", "fp32_lm_head": True},
+            )
+
+    def test_validate_rejects_mutation(self):
         tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": False,
-            "prime_rl": {
-                "fused_cross_entropy": "liger",
-                "fp32_lm_head": True,
-            },
-        }
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            tc.n_gpus = 0
 
     def test_to_wire_required_fields(self):
         wire = _ok_training().to_wire()
@@ -220,14 +218,11 @@ class TestTrainingConfig:
         assert _ok_training().to_wire()["n_gpus"] == 2
 
     def test_validate_rejects_zero_n_gpus(self):
-        tc = _ok_training()
-        tc.n_gpus = 0
-        with pytest.raises(ValueError, match="n_gpus"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=0)
 
     def test_to_wire_includes_multiplex_job_id_when_set(self):
-        tc = _ok_training()
-        tc.multiplex_job_id = "train-1"
+        tc = TrainingConfig(optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2, multiplex_job_id="train-1")
         assert tc.to_wire()["multiplex_job_id"] == "train-1"
 
     def test_to_wire_omits_multiplex_job_id_when_none(self):
@@ -247,17 +242,19 @@ class TestTrainingConfig:
         assert tc.to_wire()["load_optimizer_states"] is True
 
     def test_to_wire_merges_extra_passthrough(self):
-        tc = _ok_training()
-        tc.extra = {"fp16": {"enabled": True}, "zero_stage": 2}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"fp16": {"enabled": True}, "zero_stage": 2},
+        )
         wire = tc.to_wire()
         assert wire["fp16"] == {"enabled": True}
         assert wire["zero_stage"] == 2
 
     def test_to_wire_extra_does_not_override_required(self):
-        # If a caller stuffs a required field name into `extra`, the typed
-        # required value wins. Mirrors setdefault semantics.
-        tc = _ok_training()
-        tc.extra = {"max_seq_len": 999, "optimizer": {"type": "sgd"}}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"max_seq_len": 999, "optimizer": {"type": "sgd"}},
+        )
         wire = tc.to_wire()
         assert wire["max_seq_len"] == 128
         assert wire["optimizer"] == {"type": "adamw", "lr": 1e-5}
@@ -271,12 +268,12 @@ class TestInferenceConfig:
         _ok_inference().validate()
 
     def test_validate_rejects_zero(self):
-        with pytest.raises(ValueError, match="max_seq_len"):
-            InferenceConfig(max_seq_len=0, n_gpus=1).validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            InferenceConfig(max_seq_len=0, n_gpus=1)
 
     def test_validate_rejects_zero_n_gpus(self):
-        with pytest.raises(ValueError, match="n_gpus"):
-            InferenceConfig(max_seq_len=2048, n_gpus=0).validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            InferenceConfig(max_seq_len=2048, n_gpus=0)
 
     def test_to_wire_includes_extra(self):
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"gpu_memory_utilization": 0.9})
@@ -313,7 +310,7 @@ class TestSubJobConfigFactories:
         assert sub.model_name == "gpt2"
         assert isinstance(sub.training, TrainingConfig)
         assert sub.sampling is None
-        assert sub.training.extra == {}
+        assert sub.training.model_extra == {}
 
     def test_training_job_factory_full(self):
         sub = SubJobConfig.training_job(
@@ -337,11 +334,11 @@ class TestSubJobConfigFactories:
         assert sub.training.multiplex_job_id == "train-1"
         assert sub.training.load_optimizer_states is False
         assert sub.training.to_wire()["load_optimizer_states"] is False
-        assert sub.training.extra == {"fp16": {"enabled": True}}
+        assert sub.training.model_extra == {"fp16": {"enabled": True}}
         assert sub.global_batch_size == 4
         assert sub.dtype == "bf16"
         assert sub.seed == 42
-        assert sub.model_post_init == ["init_a", "init_b"]
+        assert sub.model_post_init_ops == ["init_a", "init_b"]
         assert sub.source_checkpoint_info == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_job_factory_default_type(self):
@@ -370,17 +367,21 @@ class TestSubJobConfigFactories:
         )
         assert sub.source_checkpoint_info == source
 
-    def test_sampling_job_factory_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
-            job_type=JobType.LOG_PROBABILITY,
-        )
-        assert sub.job_type == JobType.LOG_PROBABILITY
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_sampling_job_factory_rejects_log_probability(self, job_type):
+        with pytest.raises(
+            ValueError,
+            match=r"sampling_job\(\)\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            SubJobConfig.sampling_job(
+                model_name="gpt2",
+                max_seq_len=128,
+                n_gpus=1,
+                job_type=job_type,
+            )
 
     def test_sampling_job_factory_rejects_training_type(self):
-        with pytest.raises(ValueError, match="SAMPLING or LOG_PROBABILITY"):
+        with pytest.raises(ValueError, match="only accepts SAMPLING, got"):
             SubJobConfig.sampling_job(
                 model_name="gpt2",
                 max_seq_len=128,
@@ -401,7 +402,7 @@ class TestSubJobConfigFactories:
             extra_training=extra,
         )
         extra["leaked"] = "yes"
-        assert "leaked" not in sub.training.extra
+        assert "leaked" not in (sub.training.model_extra or {})
 
 
 # ─── SubJobConfig — validate ────────────────────────────────────────────
@@ -430,50 +431,49 @@ class TestSubJobConfigValidate:
         ).validate()
 
     def test_rejects_empty_model_name(self):
-        with pytest.raises(ValueError, match="model_name"):
+        with pytest.raises(ValidationError, match="model_name"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="",
                 training=_ok_training(),
-            ).validate()
+            )
 
     def test_training_without_training_block(self):
-        with pytest.raises(ValueError, match="training sub-job requires"):
-            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="training sub-job requires"):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")
 
     def test_sampling_without_sampling_block(self):
-        with pytest.raises(ValueError, match="sampling sub-job requires"):
-            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="sampling sub-job requires"):
+            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2")
 
     def test_log_probability_without_sampling_block(self):
-        with pytest.raises(ValueError, match="log_probability sub-job requires"):
+        with pytest.raises(ValidationError, match="log_probability sub-job requires"):
             SubJobConfig(
                 job_type=JobType.LOG_PROBABILITY,
                 model_name="gpt2",
-            ).validate()
+            )
 
     def test_mutually_exclusive(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="gpt2",
                 training=_ok_training(),
                 sampling=_ok_inference(),
-            ).validate()
+            )
 
     def test_propagates_nested_validation_failure(self):
-        bad = SubJobConfig(
-            job_type=JobType.TRAINING,
-            model_name="gpt2",
-            training=TrainingConfig(
-                optimizer={"type": "adamw"},
-                max_seq_len=128,
-                train_batch_size=0,
-                n_gpus=2,
-            ),
-        )
-        with pytest.raises(ValueError, match="train_batch_size"):
-            bad.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            SubJobConfig(
+                job_type=JobType.TRAINING,
+                model_name="gpt2",
+                training=TrainingConfig(
+                    optimizer={"type": "adamw"},
+                    max_seq_len=128,
+                    train_batch_size=0,
+                    n_gpus=2,
+                ),
+            )
 
 
 # ─── SubJobConfig — to_wire ─────────────────────────────────────────────
@@ -520,11 +520,12 @@ class TestSubJobConfigToWire:
         assert wire["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_block_used_for_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
+        # Constructed directly: the factory rejects log-probability, but the
+        # schema type still serializes.
+        sub = SubJobConfig(
             job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=InferenceConfig(max_seq_len=128, n_gpus=1),
         )
         wire = sub.to_wire()
         assert wire["job_type"] == "log_probability"
@@ -578,6 +579,52 @@ class TestClientConstruction:
         assert c.poll_timeout == 1800.0
         assert c.poll_backoff_multiplier == 1.25
         assert c.poll_max_interval == 6.0
+
+    def test_default_request_timeout_is_a_connect_read_pair(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test", database="DB", schema="SCH"
+        )
+        assert c.request_timeout == (30.0, 600.0)
+        assert c._session.default_timeout == c.request_timeout
+
+    def test_scalar_request_timeout_applies_to_connect_and_read(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test",
+            database="DB",
+            schema="SCH",
+            request_timeout=12,
+        )
+        assert c.request_timeout == (12.0, 12.0)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [0, -1, (30.0, 0), (30.0,), float("inf"), float("nan"), None, True, "30"],
+    )
+    def test_rejects_invalid_request_timeout(self, bad):
+        with pytest.raises(ValueError, match="request_timeout"):
+            CortexTrainingClient(
+                base_url="http://x.test",
+                database="DB",
+                schema="SCH",
+                request_timeout=bad,
+            )
+
+    def test_session_injects_default_timeout_unless_call_overrides_it(
+        self, monkeypatch
+    ):
+        seen = []
+
+        def fake_request(_session, *_args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((2.0, 3.0))
+
+        session.get("http://x.test/default")
+        session.get("http://x.test/override", timeout=(0.5, 1.0))
+
+        assert seen == [(2.0, 3.0), (0.5, 1.0)]
 
     @pytest.mark.parametrize(
         ("kwargs", "match"),
@@ -642,6 +689,103 @@ class TestClientConstruction:
         assert c._metric_emitter.timeout == 1.5
         assert c._metric_emitter.token_provider.timeout == 1.5
 
+    def test_from_connection_name_uses_connector_context(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example:8443"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        auth.open_artifact_connection = MagicMock()
+        auth_type = MagicMock(return_value=auth)
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", auth_type)
+
+        c = CortexTrainingClient.from_connection_name("training-profile")
+
+        auth_type.assert_called_once_with("training-profile")
+        assert c.base_url == "https://profile.example:8443"
+        assert c.database == "PROFILE_DB"
+        assert c.schema == "PROFILE_SCHEMA"
+        assert c._auth_provider is auth
+        assert c._artifact_connection_factory is auth.open_artifact_connection
+        assert isinstance(
+            c._metric_emitter.token_provider,
+            nc.SnowflakeTelemetryTokenProvider,
+        )
+        assert c._metric_emitter.token_provider._auth is auth
+
+        c.close()
+        auth.close.assert_called_once()
+
+    def test_from_connection_name_allows_routing_overrides(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        c = CortexTrainingClient.from_connection_name(
+            "training-profile", database="OVERRIDE_DB", schema="OVERRIDE_SCHEMA"
+        )
+
+        assert c.database == "OVERRIDE_DB"
+        assert c.schema == "OVERRIDE_SCHEMA"
+
+    def test_from_connection_name_requires_database(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = None
+        auth.schema = None
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        with pytest.raises(ValueError, match="must set database"):
+            CortexTrainingClient.from_connection_name("training-profile")
+
+        auth.close.assert_called_once()
+
+    def test_profile_client_sends_live_session_token(self):
+        c = _make_client(get_json={"job_id": "j1"})
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/j1",
+            headers={"Authorization": 'Snowflake Token="session-token"'},
+        )
+
+    def test_profile_client_refreshes_and_replays_once_on_session_expiry(self):
+        c = _make_client()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        succeeded = _make_response({"job_id": "j1"})
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_args_list[0].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="old-token"'
+        }
+        assert c._session.get.call_args_list[1].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="new-token"'
+        }
+
+    def test_profile_client_does_not_refresh_structured_non_expiry_401(self):
+        c = _make_client()
+        rejected = _make_error_response({"code": "390100"}, status_code=401)
+        c._session.get.return_value = rejected
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("j1")
+
+        auth.refresh.assert_not_called()
+
     def test_emit_metric_is_noop_without_pat(self):
         c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c.emit_metric("event") is None
@@ -659,6 +803,14 @@ class TestClientConstruction:
         c.close()
         c._metric_emitter.close.assert_called_once()
         c._session.close.assert_called_once()
+
+    def test_close_releases_profile_auth(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+
+        c.close()
+
+        c._auth_provider.close.assert_called_once()
 
     def test_telemetry_close_error_does_not_skip_http_session_close(self):
         c = _make_client()
@@ -941,11 +1093,10 @@ class TestCreateJob:
             c.create_job(sub_jobs=[])
 
     def test_validates_each_sub_job_before_post(self):
-        c = _make_client()
-        bad = SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
-        with pytest.raises(ValueError):
-            c.create_job(sub_jobs=[bad])
-        c._session.post.assert_not_called()
+        # Pydantic validates on construction, so an invalid SubJobConfig
+        # cannot even be created — no HTTP call is possible.
+        with pytest.raises(ValidationError):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
 
     def test_posts_in_flight_yaml_shape(self):
         c = _make_client(post_json={"job_id": "srv-1"})
@@ -1148,6 +1299,81 @@ class TestCreateJob:
             c.create_job(sub_jobs=[training, training])
         c._session.post.assert_not_called()
 
+    def test_rejects_log_probability_sub_job_before_post(self):
+        c = _make_client()
+        training = SubJobConfig.training_job(
+            model_name="gpt2",
+            optimizer={"type": "adamw"},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        log_prob = SubJobConfig(
+            job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=_ok_inference(),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sub_jobs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job(sub_jobs=[training, log_prob])
+        c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_create_job_from_body_rejects_log_probability_before_post(self, job_type):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    # Only the two documented aliases are rejected; anything else is left to the
+    # server so a newly added schema value is not blocked client-side.
+    @pytest.mark.parametrize("job_type", ["log-probability", "logprob", "sampling"])
+    def test_create_job_from_body_allows_other_job_types(self, job_type):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                }
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
+    def test_create_job_from_body_skips_non_dict_sub_job_configs(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                "log_probability",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
     def test_create_job_from_body_rejects_two_training_sub_jobs_before_post(self):
         c = _make_client()
         body = {
@@ -1303,7 +1529,9 @@ class TestReadAndControl:
             "pending_gpus": 16,
             "available_gpus": 40,
         }
-        c._session.get.assert_called_once_with(f"{c._prefix}/capacity")
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=nc._CAPACITY_REQUEST_TIMEOUT
+        )
 
     def test_get_capacity_reports_uncapped_ceiling(self):
         # -1 is the uncapped sentinel and must survive as-is: 0 is a real quota
@@ -1319,8 +1547,45 @@ class TestReadAndControl:
         c = _make_client(get_json={"has_reservation": True, "reserved_gpus": 32})
         c.get_capacity(hardware=Hardware.B200)
         c._session.get.assert_called_once_with(
-            f"{c._prefix}/capacity", params={"hardware": "B200"}
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"hardware": "B200"},
         )
+
+    def test_get_capacity_uses_shorter_caller_timeout_and_does_not_retry(self):
+        c = _make_client()
+        c.request_timeout = (2.0, 0.5)
+        c._session.get.side_effect = nc.requests.exceptions.ReadTimeout("silent peer")
+
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.get_capacity()
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=(2.0, 0.5)
+        )
+
+    def test_get_capacity_still_replays_once_for_expired_profile_token(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_error_response({"code": "390112"}, status_code=401),
+            _make_response({"available_gpus": 8}),
+        ]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_capacity()["available_gpus"] == 8
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_count == 2
+        assert c._session.get.call_args_list[0].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="old-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
+        assert c._session.get.call_args_list[1].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="new-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
 
     def test_get_capacity_rejects_unknown_hardware(self):
         c = _make_client(get_json={})
@@ -1696,21 +1961,34 @@ class TestDataPlane:
             strict=True,
         )
         assert out == {"request_id": "s1", "count": 2}
+        # The stream path sends one unchunked frame, never a chunk group.
+        c._session.post.assert_called_once()
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/generate-stream"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
-        import json as _json
+        body = _wire_load(kwargs["data"])
+        assert body["sampling_params"] == [
+            {"max_tokens": 4, "temperature": 0.7},
+            {"max_tokens": 2, "temperature": 0.3},
+        ]
+        assert body["routing_key"] == ["rk-1", None]
+        assert body["strict"] is True
+        prompts = body["prompts"]
+        assert [p.dtype for p in prompts] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in prompts] == [[1, 2], [3, 4]]
 
-        body = _json.loads(kwargs["data"])
-        assert body == {
-            "prompts": [[1, 2], [3, 4]],
-            "sampling_params": [
-                {"max_tokens": 4, "temperature": 0.7},
-                {"max_tokens": 2, "temperature": 0.3},
-            ],
-            "routing_key": ["rk-1", None],
-            "strict": True,
-        }
+    def test_generate_stream_frame_matches_generate_frame(self):
+        prompts = ["hello", [1, 2, 3]]
+        unary = _make_client(post_json={"request_id": "g-same"})
+        unary.generate("j1", prompts=prompts)
+        stream = _make_client(post_json={"request_id": "s-same"})
+        stream.generate_stream("j1", prompts=prompts)
+
+        from_unary = _wire_load(unary._session.post.call_args.kwargs["data"])["prompts"]
+        from_stream = _wire_load(stream._session.post.call_args.kwargs["data"])["prompts"]
+        assert from_unary[0] == from_stream[0] == "hello"
+        assert from_unary[1].dtype == from_stream[1].dtype == torch.int32
+        assert torch.equal(from_unary[1], from_stream[1])
 
     def test_generate_chunks_oversized_payload(self):
         c = _make_client()
@@ -1797,6 +2075,54 @@ class TestDataPlane:
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
             c.generate_stream("j1", prompts=[[1, 2, 3, 4, 5]])
         c._session.post.assert_not_called()
+
+    def test_generate_rejects_overlong_flat_tokenized_prompt(self):
+        # A flat list of ids is one prompt, so the reported index is 0 even
+        # though the list has four elements.
+        c = _make_client(
+            post_json={"request_id": "g-flat"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=[1, 2, 3, 4])
+        c._session.post.assert_not_called()
+
+    def test_generate_rejects_mixed_flat_token_list(self):
+        c = _make_client(
+            post_json={"request_id": "g-mixed"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            c.generate("j1", prompts=[1, 2.5])
+        c._session.post.assert_not_called()
+
+    def test_generate_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == "g-tensor"
+        c._session.post.assert_called_once()
+
+    def test_generate_rejects_overlong_bare_tensor_prompt(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor-long"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+        c._session.post.assert_not_called()
+
+    def test_generate_stream_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "s-tensor", "count": 1},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate_stream("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == {
+            "request_id": "s-tensor",
+            "count": 1,
+        }
+        c._session.post.assert_called_once()
 
     def test_step_no_lr(self):
         c = _make_client(post_json={"request_id": "r2"})
@@ -2027,6 +2353,7 @@ class TestDataPlane:
             sub_job_type="training",
         )
         assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={
@@ -2040,6 +2367,7 @@ class TestDataPlane:
     def test_forward_operation_omits_none_fields(self):
         c = _make_client(post_json={"ok": True})
         c.forward("j1")
+        assert not c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={"operation_type": "forward"},
@@ -2187,6 +2515,72 @@ class TestDataPlane:
         }
 
 
+# ─── Pre-tokenized prompt packing ────────────────────────────────────────
+
+
+class TestPromptTensorPacking:
+    def test_batch_of_token_lists_becomes_int32_tensors(self):
+        packed = nc._pack_token_prompts([[1, 2], [3, 4, 5]])
+        assert [p.dtype for p in packed] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in packed] == [[1, 2], [3, 4, 5]]
+
+    def test_string_prompts_are_left_alone(self):
+        assert nc._pack_token_prompts(["a", "b"]) == ["a", "b"]
+
+    def test_mixed_batch_packs_only_token_lists(self):
+        packed = nc._pack_token_prompts(["a", [1, 2]])
+        assert packed[0] == "a"
+        assert packed[1].tolist() == [1, 2]
+
+    def test_empty_inner_list_stays_a_list(self):
+        # The server's own non-empty check should be the one that rejects it.
+        assert nc._pack_token_prompts([[]]) == [[]]
+
+    def test_mixed_flat_list_is_rejected(self):
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            nc._pack_token_prompts([1, 2.5])
+
+    def test_bool_list_is_not_packed_as_token_ids(self):
+        assert nc._pack_token_prompts([True, False]) == [True, False]
+
+    def test_flat_token_list_is_one_prompt(self):
+        packed = nc._pack_token_prompts([7, 8, 9])
+        assert torch.is_tensor(packed)
+        assert packed.dtype == torch.int32
+        assert packed.tolist() == [7, 8, 9]
+
+    def test_empty_and_non_list_prompts_are_unchanged(self):
+        assert nc._pack_token_prompts([]) == []
+        assert nc._pack_token_prompts("hello") == "hello"
+
+    def test_existing_tensor_is_not_recast(self):
+        tensor = torch.tensor([1, 2], dtype=torch.int64)
+        assert nc._pack_token_prompts(tensor) is tensor
+        assert nc._pack_token_prompts([tensor])[0] is tensor
+
+    def test_token_id_beyond_int32_falls_back_to_int64(self, caplog):
+        caplog.set_level(logging.WARNING, logger=nc.logger.name)
+        packed = nc._pack_token_prompts([[2**31]])
+        assert packed[0].dtype == torch.int64
+        assert packed[0].tolist() == [2**31]
+        assert "int32" in caplog.text
+
+    def test_env_var_keeps_list_prompts_inside_the_frame(self, monkeypatch):
+        # The hatch changes the encoding of the prompts, not the body: both
+        # calls still post a DSSST1 frame.
+        monkeypatch.setenv(nc.DISABLE_TENSOR_PROMPTS_ENV, "1")
+
+        unary = _make_client(post_json={"request_id": "g-raw"})
+        unary.generate("j1", prompts=[[1, 2], [3, 4]])
+        stream = _make_client(post_json={"request_id": "s-raw", "count": 2})
+        stream.generate_stream("j1", prompts=[[1, 2], [3, 4]])
+
+        for client in (unary, stream):
+            kwargs = client._session.post.call_args.kwargs
+            assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
+            assert _wire_load(kwargs["data"])["prompts"] == [[1, 2], [3, 4]]
+
+
 # ─── CortexTrainingClient — request polling ──────────────────────────────────
 
 
@@ -2224,6 +2618,7 @@ class TestRequestPolling:
                 "text": "ok",
                 "token_ids": torch.tensor([1, 2, 3], dtype=torch.int64),
                 "logprobs": torch.tensor([0.125, -0.5], dtype=torch.float32),
+                "metrics": {"model/tokens": 3},
             }
         )
         c = _make_client(
@@ -2239,6 +2634,7 @@ class TestRequestPolling:
                             "encoding": "base64",
                             "wire_format": "DSSST1",
                             "payload_b64": base64.b64encode(payload).decode("ascii"),
+                            "metrics": {"router_replay/tx_bytes_avg": 12.0},
                         },
                     },
                     {"type": "done", "completed": 1, "failed": 0},
@@ -2254,6 +2650,10 @@ class TestRequestPolling:
                     "text": "ok",
                     "token_ids": [1, 2, 3],
                     "logprobs": [0.125, -0.5],
+                    "metrics": {
+                        "model/tokens": 3,
+                        "router_replay/tx_bytes_avg": 12.0,
+                    },
                 },
             },
             {"type": "done", "completed": 1, "failed": 0},
@@ -2304,11 +2704,67 @@ class TestRequestPolling:
                     "encoding": "base64",
                     "wire_format": "DSSST1",
                     "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0},
                 },
             }
         )
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
-        assert c.poll_request("j1", "r1") == {"avg_loss": 0.5}
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"router_replay/tx_bytes_avg": 12.0},
+        }
+
+    def test_poll_request_keeps_payload_metrics_when_envelope_has_none(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps({"avg_loss": 0.5, "metrics": {"model/tokens": 8}})
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"model/tokens": 8},
+        }
+
+    def test_poll_request_envelope_metrics_win_on_key_collision(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {
+                "avg_loss": 0.5,
+                "metrics": {"model/tokens": 8, "shared/bytes": 1.0},
+            }
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0, "shared/bytes": 2.0},
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {
+                "model/tokens": 8,
+                "shared/bytes": 2.0,
+                "router_replay/tx_bytes_avg": 12.0,
+            },
+        }
 
     def test_poll_request_keeps_non_generate_dssst1_tensors(self, monkeypatch):
         from cortex_training import wire
@@ -2373,6 +2829,63 @@ class TestRequestPolling:
         }
         assert "r-generate" not in c._generate_request_ids
 
+    def test_poll_request_decodes_a_legacy_forward_result_envelope(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.25, -1.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "job_id": "j1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_peak": 24.0},
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.25, -1.5]))
+        assert result["metrics"] == {"router_replay/tx_bytes_peak": 24.0}
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_leaves_a_self_describing_forward_result_alone(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.5]))
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_forgets_a_forward_id_on_failure(self, monkeypatch):
+        c = _make_client(get_json={"status": "failed", "error": "boom"})
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            c.poll_request("j1", "r-forward")
+        assert "r-forward" not in c._forward_request_ids
+
     def test_poll_request_decodes_chunked_dssst1_result(self, monkeypatch):
         from cortex_training import wire
 
@@ -2387,14 +2900,23 @@ class TestRequestPolling:
             }
             body = {"status": "running", "events": [event], "next_cursor": str(idx + 1)}
             if idx == len(chunks) - 1:
-                body = {"status": "done", "events": [event]}
+                body = {
+                    "status": "done",
+                    "events": [event],
+                    "result": {
+                        "metrics": {"router_replay/tx_max_bytes": 4096.0},
+                    },
+                }
             responses.append(_make_response(body))
 
         c = _make_client()
         c._session.get.side_effect = responses
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
 
-        assert c.poll_request("j1", "r1") == {"text": "x" * 20_000}
+        assert c.poll_request("j1", "r1") == {
+            "text": "x" * 20_000,
+            "metrics": {"router_replay/tx_max_bytes": 4096.0},
+        }
         assert c._session.get.call_args_list[1].kwargs["params"] == {"cursor": "1"}
 
     def test_poll_request_failed(self, monkeypatch):
@@ -2597,9 +3119,58 @@ class TestExecutionLogDownload:
             with pytest.raises(ValueError, match="unsafe"):
                 nc._validate_artifact_relative_path(path)
 
-    def test_artifact_connection_requires_pat_client(self):
-        with pytest.raises(RuntimeError, match="PAT-authenticated"):
+    def test_artifact_connection_requires_snowflake_client(self):
+        with pytest.raises(RuntimeError, match="Snowflake-authenticated"):
             _make_client()._open_experiment_artifact_connection()
+
+    def test_artifact_connection_uses_profile_factory(self):
+        c = _make_client()
+        connected = object()
+        c._artifact_connection_factory = MagicMock(return_value=connected)
+
+        assert c._open_experiment_artifact_connection() is connected
+        c._artifact_connection_factory.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("host", "account"),
+        [
+            ("locatorhost.snowflakecomputing.com", "locatorhost"),
+            ("myorg-myaccount.snowflakecomputing.com", "myorg-myaccount"),
+            ("account.qa6.us-west-2.aws.snowflakecomputing.com", "account"),
+            ("testaccount-12345.global.snowflakecomputing.com", "testaccount"),
+        ],
+    )
+    def test_connection_kwargs_use_pat_host_as_account(self, monkeypatch, host, account):
+        monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
+        c = CortexTrainingClient.from_pat(
+            host=host,
+            pat="tok-xyz",
+            database="DB",
+            schema="SCH",
+        )
+        identity_queries = []
+
+        def identity(statement):
+            identity_queries.append(statement)
+            return ["USER1", "ROLE1"]
+
+        monkeypatch.setattr(c, "_query_sql_row", identity)
+        kwargs = c._snowflake_connection_kwargs()
+        assert identity_queries == ["SELECT CURRENT_USER(), CURRENT_ROLE()"]
+        assert importlib.import_module("snowflake.connector.util_text").parse_account(host) == account
+        assert kwargs["host"] == host
+        assert kwargs["account"] == host
+        assert kwargs["user"] == "USER1"
+        assert kwargs["role"] == "ROLE1"
+        assert kwargs["authenticator"] == "PROGRAMMATIC_ACCESS_TOKEN"
+        assert kwargs["token"] == "tok-xyz"
+
+        connector = importlib.import_module("snowflake.connector")
+        connected = object()
+        connect = MagicMock(return_value=connected)
+        monkeypatch.setattr(connector, "connect", connect)
+        assert c._open_experiment_artifact_connection() is connected
+        connect.assert_called_once_with(**kwargs)
 
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
@@ -2808,3 +3379,124 @@ class TestExecutionLogDownload:
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
         with pytest.raises(ValueError, match="experiment_run_name"):
             c.fetch_execution_logs("job-1")
+
+
+# ─── _ensure_database ──────────────────────────────────────────────────
+
+
+class TestEnsureDatabase:
+    def test_skipped_for_http_base_url(self):
+        """Mock/test mode: no DB check at all."""
+        c = CortexTrainingClient(base_url="http://test.local", database="DB", schema="SCH")
+        c._session = MagicMock()
+        c._session.get.return_value = _make_response({"jobs": []})
+        c._send("GET", f"{c.base_url}/test")
+        c._session.post.assert_not_called()
+
+    def test_no_extra_call_when_db_exists(self):
+        """Happy path: DB exists, no CREATE DATABASE call made."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        api_resp = _make_response({"jobs": []})
+        c._session.get.return_value = api_resp
+        c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
+        # Only the GET was made, no POST to /statements
+        c._session.post.assert_not_called()
+
+    def test_creates_db_on_not_found_then_retries(self):
+        """DB missing: first request fails, CREATE DATABASE, retry succeeds."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        create_call = c._session.post.call_args_list[0]
+        assert "/api/v2/statements" in create_call.args[0]
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in create_call.kwargs["json"]["statement"]
+        assert c._session.get.call_count == 2
+
+    def test_only_retries_once(self):
+        """If DB is still missing after CREATE, don't loop — raise the error."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["OK"]]})
+        c._session.get.return_value = not_found_resp
+        c._session.post.return_value = create_resp
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+            c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+
+    def test_raises_when_create_fails_permission(self):
+        """CREATE DATABASE fails with 403: raise with actionable message."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
+        c._session.get.return_value = not_found_resp
+        c._session.post.return_value = perm_resp
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+            c._send("GET", f"{c.base_url}/test")
+
+    def test_lowercase_database_name_not_quoted(self):
+        """Lowercase DB names are NOT quoted — SQL resolves the same as the URL path."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["OK"]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
+        create_call = c._session.post.call_args_list[0]
+        stmt = create_call.kwargs["json"]["statement"]
+        assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
+        assert '"' not in stmt
+
+    def test_creates_schema_when_not_public(self):
+        """Non-PUBLIC schema triggers CREATE SCHEMA after CREATE DATABASE."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="CUSTOM")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        create_schema_resp = _make_response({"data": [["Schema CUSTOM successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.side_effect = [create_db_resp, create_schema_resp]
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        assert c._session.post.call_count == 2
+        db_call = c._session.post.call_args_list[0]
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in db_call.kwargs["json"]["statement"]
+        schema_call = c._session.post.call_args_list[1]
+        assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
+
+    def test_skips_schema_creation_for_public(self):
+        """PUBLIC schema does not trigger CREATE SCHEMA."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_db_resp
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        # Only one POST for CREATE DATABASE, no schema creation
+        assert c._session.post.call_count == 1

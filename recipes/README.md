@@ -12,6 +12,9 @@ under its `configs/` directory.
 | [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
 
+GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its
+own entry point and install rather than the prerequisites below.
+
 ## Prerequisites
 
 Install the client and recipe dependencies from the repository root:
@@ -34,6 +37,12 @@ command (`wandb_project=...`) and export:
 export WANDB_API_KEY=...
 export WANDB_BASE_URL=...
 ```
+
+To log the same metrics to Snowflake experiment tracking, pass
+`sf_tracking=True` on the train command after `uv pip install
+"snowflake-ml-python>=1.19.0"`. Results appear in Snowsight under
+**AI & ML > Experiments**. See the
+[Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 ## Running Recipes
 

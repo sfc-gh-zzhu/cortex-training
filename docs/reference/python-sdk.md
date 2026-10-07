@@ -8,7 +8,18 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a Programmatic Access Token:
+Construct it with a named Snowflake connection profile:
+
+```python
+client = CortexTrainingClient.from_connection_name("training")
+```
+
+Pass no name to use the Connector-configured default profile. The profile's
+database and schema are used unless explicitly overridden. The client shares
+the profile's live Snowflake session token with REST and telemetry calls,
+reconnecting once when the API reports token expiry.
+
+Direct Programmatic Access Token construction remains supported:
 
 ```python
 client = CortexTrainingClient.from_pat(
@@ -21,13 +32,15 @@ client = CortexTrainingClient.from_pat(
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10). `from_pat` also accepts
-`telemetry_timeout` (3s) for best-effort client metrics.
+(6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
+(`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
+and read timeout, or a `(connect, read)` pair. `from_connection_name` and
+`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
 ## Client metrics
 
-Clients created with `CortexTrainingClient.from_pat` automatically emit one
-best-effort event when an essential operation fails. Set
+Snowflake profile and PAT clients automatically emit one best-effort event
+when an essential operation fails. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to also emit successful outcomes.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
@@ -74,13 +87,23 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. A job takes zero or one `training` sub-job and any number of `sampling` / `log_probability` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
-| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job rule before sending |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
+
+`JobType.LOG_PROBABILITY` stays a schema type: a `SubJobConfig` carrying it
+still constructs, validates, and serializes to `"log_probability"`. Submission
+is what is blocked. `create_job()`, `create_job_from_body()`,
+`SubJobConfig.sampling_job()`, and `cortex-training submit` (including
+`--dry-run`) all raise before sending, with the message
+`log_probability sub-jobs are not currently supported` prefixed by the offending
+location — for example
+`sub_job_configs[1].job_type: log_probability sub-jobs are not currently
+supported`. The short alias `log_prob` is rejected the same way.
 
 ## Training and sampling
 
@@ -89,12 +112,28 @@ operation.
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
 | `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
-| `generate_stream(...)` | response dict | UTF-8 JSON body; read progress with `get_request_status` |
+| `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | See the known limitation in [rest-api.md section 14](rest-api.md#14-known-limitations) |
-| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding and chunked results |
+| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding, chunked results, and envelope `metrics` merge (envelope wins on key collision) |
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
+
+A training sub-job with router replay picks how forward/backward treats rows
+whose routing no sampling worker holds with `router_replay["mode"]` in the
+`extra_training` argument of `SubJobConfig.training_job(...)`, together with
+`"enabled": true`:
+
+- `"strict"` (default) fails the request.
+- `"best_effort"` routes those rows with the trainer's own MoE gate and adds
+  `router_replay/rows_*` and `router_replay/tokens_*` keys to the polled
+  result's `metrics`. With whole-block activation checkpointing it also needs
+  `ac_config.router_replay_recompute` left at its default `true`.
+
+The server rejects `"best_effort"` without `"enabled": true`, and any mode
+other than `"strict"` on a sampling sub-job. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
+[section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
 ## Checkpoints
 

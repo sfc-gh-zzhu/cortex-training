@@ -33,6 +33,12 @@ sub-jobs:
 - `sampling`: generation and sampling-side operations.
 - `log_probability`: a log-probability worker configuration.
 
+Only `training` and `sampling` sub-jobs can be submitted. Both the Python
+client and the CLI reject a `log_probability` sub-job before sending the
+request, with the location-prefixed message
+`log_probability sub-jobs are not currently supported`; the short alias
+`log_prob` is rejected the same way.
+
 The common RL layout is one training sub-job and one sampling sub-job in the
 same job.
 
@@ -95,12 +101,7 @@ https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_connection_name("training")
 ```
 
 The SQL statements API used by execution-log download is outside this prefix:
@@ -112,9 +113,21 @@ https://{account_host}/api/v2/statements
 If you point the client at a server that exposes the endpoint under a
 different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
-### 2.2 PAT authentication
+### 2.2 Authentication
 
-`CortexTrainingClient.from_pat(...)` sends:
+`CortexTrainingClient.from_connection_name(...)` uses the Snowflake
+Connector's resolved REST origin and live session token:
+
+```http
+Authorization: Snowflake Token="<session-token>"
+```
+
+The client reconnects once and replays the request when Snowflake explicitly
+reports that the session token expired. Named profiles and the configured
+default profile are supported.
+
+Direct PAT compatibility is available through
+`CortexTrainingClient.from_pat(...)`, which sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -130,7 +143,7 @@ TLS verification is enabled unless `verify_ssl=False` is passed.
 | Control-plane calls, `step`, `save`, `load`, `operation` | `application/json` | JSON |
 | `forward-backward` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
 | `generate` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
-| `generate-stream` | `application/octet-stream` | JSON encoded as UTF-8 bytes |
+| `generate-stream` | `application/octet-stream` | DSSST1 safetensors frame, sent in one request and capped at 60 MiB |
 
 Raw `torch.save`/pickle is not the current binary protocol. See
 [section 9](#9-dssst1-binary-wire-protocol).
@@ -218,11 +231,18 @@ All values are configurable on `CortexTrainingClient(...)`.
 
 ### 3.5 Retries
 
+Every HTTP request has a default 30-second connect timeout and 600-second read
+timeout. Callers can configure a shorter positive scalar or a `(connect, read)`
+pair with `CortexTrainingClient(request_timeout=...)`.
+
 The general request path retries connection/time-out failures and HTTP:
 
 ```text
 404, 409, 429, 500, 502, 503, 504
 ```
+
+Capacity is the exception: it is attempted once with the shorter bounds
+documented in [section 5.4](#54-capacity---get-capacity).
 
 The default is ten retries after the first attempt, with exponential jitter.
 
@@ -326,13 +346,18 @@ REST body:
 ```
 
 `sub_job_configs` must be a non-empty list carrying **zero or one** `training`
-sub-job and any number of `sampling` / `log_probability` sub-jobs. A second
-training sub-job is rejected with `at most one training sub-job is supported per
-job`; the server enforces the same rule for every caller.
+sub-job and any number of `sampling` sub-jobs. A second training sub-job is
+rejected with `at most one training sub-job is supported per job`; the server
+enforces the same rule for every caller. A `log_probability` (or `log_prob`)
+sub-job is rejected client-side with
+`sub_job_configs[INDEX].job_type: log_probability sub-jobs are not currently
+supported`.
 
 The typed path validates each `SubJobConfig`; `create_job_from_body()` checks the
-outer body, the non-empty list, and the training-sub-job count before forwarding
-it.
+outer body, the non-empty list, the training-sub-job count, and each sub-job's
+`job_type` for the unsupported log-probability spellings before forwarding it.
+`cortex-training submit` repeats those last two checks so `--dry-run` fails the
+same way without a connection.
 
 #### GPU hardware - `hardware`
 
@@ -451,6 +476,11 @@ create-job field: `H200`, `B200`, or `B300`, defaulting to `H200` when omitted.
 unknown value client-side. The CLI `capacity` command, with no `--hardware`
 flag, calls this endpoint once per type and wraps the results in
 `capacity_by_hardware`.
+
+The SDK attempts each capacity lookup once with at most a 10-second connect
+timeout and a 30-second read timeout; a shorter configured request timeout still
+wins. This endpoint is a fast control-plane read, so a silent network, proxy, or
+service hop fails rather than blocking indefinitely.
 
 ```json
 {
@@ -636,6 +666,23 @@ The exact metrics are backend/loss dependent. The current ArcticTraining
 forward/backward response assembler intentionally returns
 `post_process_outputs` as an empty object; callers must not assume that
 `compute_logprobs` appears there.
+
+When the training sub-job sets `router_replay.mode = "best_effort"` (see
+[section 8.2](#82-trainingconfig)), `metrics` of a forward/backward request that
+carries router-replay ids also reports how the request's rows were routed. Each row is counted once, however rows are sharded across
+data-parallel and sequence-parallel ranks. A "fresh" row is one whose routing
+no sampling worker held, so the trainer's own MoE gate routed it.
+
+| Key | Meaning |
+|---|---|
+| `router_replay/rows_sent` | Rows in the request that carried a router-replay id |
+| `router_replay/rows_replayed` | Rows routed with the sampler's captured routing |
+| `router_replay/rows_fresh` | Rows routed by the trainer's own gate |
+| `router_replay/replayed_fraction` | `rows_replayed / rows_sent` (`0.0` for a request with no rows) |
+| `router_replay/tokens_replayed` | Valid tokens in replayed rows (attention-mask count; the padded length when the request has no attention mask) |
+| `router_replay/tokens_fresh` | Valid tokens in fresh rows (attention-mask count; the padded length when the request has no attention mask) |
+
+In the default `"strict"` mode these keys are absent.
 
 ### 6.2 Optimizer step - `POST /{job_id}/step`
 
@@ -836,17 +883,29 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
-- `prompts` is a list of string prompts and/or token-id lists. A single
-  tokenized prompt is `[[1, 2, 3]]`, not `[1, 2, 3]`.
+- `prompts` is a list of string prompts and/or token-id lists. A flat list of
+  integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
+  pre-tokenized prompt rather than as a batch. For a batch of several prompts,
+  use the nested form `[[1, 2, 3], [4, 5]]`.
 - `sampling_params` may be one object or a list of objects/null values aligned
   with `prompts`.
 - `routing_key` may be one string or an aligned list of strings/null values.
 - `strict` controls strict routing-key affinity.
 
+Pre-tokenized prompts travel in the frame's tensor section as `int32` tensors,
+not as JSON numbers in the frame header. A token id that does not fit `int32`
+falls back to `int64` for that prompt, which only doubles its wire size. String
+prompts are not converted — the server tokenizes them. Setting
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` to a truthy value puts the token ids
+back in the header as JSON lists; the request body is a DSSST1 frame either
+way.
+
 For pre-tokenized prompts, the client fetches and caches the sampling sub-job's
 `inference_config.max_seq_len`. It rejects a prompt when
 `len(prompt) >= max_seq_len`, preserving room for at least one output token.
-String prompts are left for the server tokenizer to validate.
+The check runs before the tensor conversion, so the environment variable above
+does not disable it. String prompts are left for the server tokenizer to
+validate.
 
 Generate uses the same DSSST1 response options as forward/backward, but unlike
 forward/backward it sends the frame unwrapped when it fits, and only splits it
@@ -873,11 +932,18 @@ converts tensor values under `results` back to Python lists.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 
-`generate_stream()` accepts the same logical fields as `generate()`, but its
-body is UTF-8 JSON under `application/octet-stream`, not DSSST1.
+`generate_stream()` accepts the same logical fields as `generate()` and encodes
+them into the same DSSST1 frame, including the `int32` tensor encoding of
+pre-tokenized prompts described in [section 6.6](#66-generate---post-job_idgenerate).
 
-The encoded body must not exceed 60 MiB. This path is not request-chunked by the
-client.
+Unlike `generate`, this path is not request-chunked: the client sends the frame
+in a single POST, and the encoded body must not exceed 60 MiB.
+
+**Breaking change.** `POST /{job_id}/generate-stream` no longer accepts a
+UTF-8 JSON body. There is no dual encoding and no negotiation — the frame is
+the only accepted request form. `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS`
+changes how prompts are encoded *inside* the frame; it does not turn the body
+back into JSON. The response is unchanged.
 
 Immediate response:
 
@@ -1204,7 +1270,7 @@ Exactly one type-specific config is set.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum |
+| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum. `log_probability` is a schema value only: the client and CLI reject it at submission |
 | `model_name` | string | yes | Must be non-empty |
 | `training_config` | object | for training | Produced from `TrainingConfig` |
 | `inference_config` | object | for sampling/log probability | Produced from `InferenceConfig` |
@@ -1263,6 +1329,26 @@ and these newer long-context/memory knobs:
   to disable). Omitted uses the server default.
 - `ac_config`: activation-checkpointing config, including CPU activation offload
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
+- `router_replay`: `{"enabled", "max_cache_bytes", "mode"}`. `mode` is
+  `"strict"` (default) or `"best_effort"`; values other than `"strict"` and
+  `"best_effort"` are rejected. It applies to the training sub-job
+  only: `"best_effort"` with `enabled` `false`, or any `mode` other than
+  `"strict"` on a sampling sub-job, is rejected. `"strict"` fails a forward/backward
+  request when any of its rows has no routing held by a sampling worker (for
+  example, a row generated before a sampler restart); the request error is
+  `router_replay_preflight_failed` with `stage` `"receive"` and `reason`
+  `"receiver_error"`. `"best_effort"` routes such rows with the trainer's own MoE
+  gate, replays the others, and reports the split in the
+  `router_replay/rows_*` and `router_replay/tokens_*` metrics of
+  [section 6.1](#61-forwardbackward---post-job_idforward-backward). A model
+  whose MoE routers cannot route a row by their own gate, or that has no MoE
+  routers, rejects `"best_effort"` when the training sub-job starts. With whole-block activation
+  checkpointing, `"best_effort"` also requires `ac_config.router_replay_recompute`
+  (default `true`); a training sub-job with it disabled rejects `"best_effort"`
+  at startup. If the service does not yet support `"best_effort"`, router-replay
+  bootstrap fails with a `router replay bootstrap rejected` error; use `"strict"`
+  until the service is upgraded. If only some sampling workers lack support, a
+  request with a missing row fails exactly as in `"strict"`.
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and
@@ -1284,6 +1370,35 @@ The typed client requires:
 
 `multiplex_job_id` is optional. `extra_sampling` is an open passthrough object;
 common values include `gpu_memory_utilization` and a nested `vllm_config`.
+
+Enable speculative decoding on a sampling sub-job with
+`vllm_config.speculative_config`. The client forwards that block to the
+server. Typical keys are `method`, `model` (the draft model), and
+`num_speculative_tokens`.
+
+`speculative_config.model` uses the same convention as `model_name`: pass an
+`<org>/<model>` Hub id. The server maps it to the baked model cache.
+Explicit local paths are used as-is. Callers should not hard-code cache
+locations.
+
+```python
+sampling = SubJobConfig.sampling_job(
+    model_name="Qwen/Qwen3.8-27B",
+    max_seq_len=16384,
+    n_gpus=8,
+    extra_sampling={
+        "vllm_config": {
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.85,
+            "speculative_config": {
+                "method": "dflash",
+                "model": "z-lab/Qwen3.8-27B-DFlash2",
+                "num_speculative_tokens": 7,
+            },
+        },
+    },
+)
+```
 
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
@@ -1426,7 +1541,14 @@ A non-chunked DSSST1 result can appear inside poll JSON as:
 }
 ```
 
-`poll_request()` base64-decodes and passes the frame to `wire.loads()`.
+`poll_request()` base64-decodes and passes the frame to `wire.loads()`. If the
+JSON envelope also has a `metrics` object, those keys are shallow-merged into
+the decoded result's `metrics`. Envelope keys win on collision. Payload
+`metrics` are kept when the envelope has none.
+
+A result with `payload_b64` but no `wire_format` is left encoded unless
+`poll_request()` is completing a `forward()` request id minted by this client.
+In that case the blob is decoded the same way and envelope `metrics` are merged.
 
 ### 9.5 Result chunks
 
@@ -1442,7 +1564,8 @@ Large results can arrive through poll events:
 
 A poll can also include `next_cursor`. `poll_request()` drains all pages,
 validates chunk SHA-256 values, uses `wire.decode_result_chunks()`, and returns
-the reconstructed object.
+the reconstructed object. Terminal-page `result.metrics` are merged into that
+object with the same envelope-wins rule as [section 9.4](#94-encoded-results).
 
 ---
 
@@ -1566,8 +1689,10 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 `fetch_execution_logs(job_id)`:
 
 1. Calls `GET /{job_id}/experiment-run`.
-2. Resolves the current user, account, and role through the SQL statements API.
-3. Opens an explicitly PAT-authenticated Snowflake Connector session.
+2. For profile clients, opens an independent connection from the same
+   Snowflake profile.
+3. For direct PAT clients, resolves the current user and role through the SQL
+   statements API and opens an equivalent Connector session.
 4. Uses experiment artifact `LIST` and `GET` to download every object below a
    `/_logs/{sub_job_id}/` subtree.
 
